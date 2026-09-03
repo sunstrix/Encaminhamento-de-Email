@@ -17,13 +17,24 @@ Tabelas:
 ==============================================================================
 """
 
+import sys
+from pathlib import Path
+
+# --- FIX DE PATH (EXECUCAO STANDALONE) -----------------------------------
+# Garante que a raiz do projeto esteja no sys.path para imports absolutos.
+# Necessario quando o script eh executado diretamente (python database/database.py)
+# em vez de como modulo (python -m database.database).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+# -------------------------------------------------------------------------
+
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from config.settings import settings
 
