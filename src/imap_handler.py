@@ -14,15 +14,21 @@ import sys
 import os
 import imaplib
 import email
-import time
 from email.header import decode_header
 from pathlib import Path
 from typing import List, Dict, Optional
 
-# --- FIX DE PATH (EXECUCAO STANDALONE) -----------------------------------
+# --- FIX DE PATH E CARREGAMENTO DE ENV -----------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Garante que o .env seja lido antes de qualquer acesso a os.getenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_PROJECT_ROOT / '.env')
+except ImportError:
+    pass # Se nao tiver python-dotenv, confia que o main.py ou o settings ja carregou
 # -------------------------------------------------------------------------
 
 from config.settings import settings
@@ -62,7 +68,7 @@ class IMAPHandler:
                 except LookupError:
                     result.append(part.decode('latin-1', errors='ignore'))
             else:
-                result.append(part)
+                result.append(str(part))
         return "".join(result).strip()
 
     @staticmethod
@@ -88,8 +94,7 @@ class IMAPHandler:
                         pass
                         
                 elif ctype == 'text/html' and not body:
-                    # Fallback: se nao achou plain text, pega o HTML (o filter engine
-                    # usa regex que funciona razoavelmente bem em HTML sujo)
+                    # Fallback: se nao achou plain text, pega o HTML
                     try:
                         payload = part.get_payload(decode=True)
                         if payload:
@@ -208,12 +213,8 @@ class IMAPHandler:
         return results
 
 
-# Instancia unica
-imap_handler = IMAPHandler()
-
-
 # ----------------------------------------------------------------------------
-# AUTO-TESTE (MOCKADO EM MEMORIA)
+# AUTO-TESTE (MOCKADO EM MEMORIA - NAO EXIGE CONEXAO/SENHA)
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 70)
@@ -247,6 +248,7 @@ Content-Type: text/html; charset="utf-8"
     print("1. Testando parseamento de Email Mockado (Multipart + UTF-8 QP)...")
     msg = email.message_from_bytes(mock_raw_email)
     
+    # Chamamos os metodos estaticos diretamente, sem instanciar a classe
     from_h = IMAPHandler._decode_header_value(msg.get("From"))
     subj = IMAPHandler._decode_header_value(msg.get("Subject"))
     body = IMAPHandler._get_body(msg)
