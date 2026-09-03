@@ -1,0 +1,67 @@
+# ==============================================================================
+# CP FANI - SISTEMA DE ENCAMINHAMENTO DE EMAILS
+# ==============================================================================
+# Dependências Python do projeto.
+# Instalar com: pip install -r requirements.txt
+#
+# Versões pinadas para garantir reprodutibilidade.
+# Atualizar com: pip install --upgrade -r requirements.txt
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# 1. CONFIGURAÇÃO
+# ------------------------------------------------------------------------------
+# Carrega variáveis do arquivo .env automaticamente
+python-dotenv==1.0.1
+
+
+# ------------------------------------------------------------------------------
+# 2. PARSING E MANIPULAÇÃO DE DATAS
+# ------------------------------------------------------------------------------
+# Parse de datas RFC 2822 dos headers de email (Date: Fri, 21 Aug 2026...)
+python-dateutil==2.9.0.post0
+
+
+# ------------------------------------------------------------------------------
+# 3. VALIDAÇÃO DE EMAIL (OPCIONAL - RECOMENDADO)
+# ------------------------------------------------------------------------------
+# Valida sintaxe e domínio dos emails antes de enviar
+# Descomente se quiser validação mais rigorosa
+# email-validator==2.1.0.post1
+
+
+# ------------------------------------------------------------------------------
+# 4. HTTP / APIs EXTERNAS (OPCIONAL - USO FUTURO)
+# ------------------------------------------------------------------------------
+# Necessário apenas se integrar com APIs (Telegram, Slack, webhook, etc)
+# requests==2.31.0
+
+
+# ------------------------------------------------------------------------------
+# 5. LOGGING AVANÇADO (OPCIONAL)
+# ------------------------------------------------------------------------------
+# Logs coloridos no terminal (DEBUG=verde, ERROR=vermelho)
+# Descomente se quiser output mais legível durante desenvolvimento
+# colorlog==6.8.2
+
+
+# ------------------------------------------------------------------------------
+# 6. ASSÍNCRONO (OPCIONAL - EVOLUÇÃO FUTURA)
+# ------------------------------------------------------------------------------
+# Necessário apenas se evoluir o pipeline para async (processamento paralelo)
+# aiohttp==3.9.3
+# aiosmtplib==3.0.1
+
+
+# ==============================================================================
+# MÓDULOS BUILT-IN (NÃO PRECISAM ESTAR AQUI - APENAS DOCUMENTAÇÃO)
+# ==============================================================================
+# imaplib      - Conexão IMAP para leitura de emails
+# smtplib      - Envio de emails via SMTP
+# email        - Parsing e construção de mensagens MIME
+# sqlite3      - Banco de dados SQLite para emails pendentes
+# pathlib      - Manipulação de caminhos de arquivos
+# logging      - Sistema de logs do Python
+# ssl          - Conexões seguras (IMAPS/SMTPS)
+# ==============================================================================
