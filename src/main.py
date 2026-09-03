@@ -64,8 +64,9 @@ class CPFaniPipeline:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run or settings.DRY_RUN
         self.imap = IMAPHandler()
-        self.filter_engine = FilterEngine(database=db)
-        self.button_handler = ButtonHandler(database=db)
+        # CORRECAO: FilterEngine e ButtonHandler nao aceitam 'database' no __init__
+        self.filter_engine = FilterEngine()
+        self.button_handler = ButtonHandler()
         self.smtp = SMTPHandler()
         self.response_handler = ResponseHandler(
             imap=self.imap, smtp=self.smtp, database=db
