@@ -7,7 +7,6 @@
 # ------------------------------------------------------------------------------
 emails_filtrados.txt
 emails_para_encaminhar.txt
-emails_unicos.txt
 extrair_emails_unicos.py
 filtrar_emails.py
 
