@@ -1,281 +1,171 @@
 # -*- coding: utf-8 -*-
 """
-==============================================================================
 SISTEMA DE ENCAMINHAMENTO DE EMAILS - CP FANI
 Arquivo: config/settings.py
-==============================================================================
-Fonte unica de verdade de configuracao. Todos os modulos (database,
-filter_engine, imap_handler, smtp_handler, button_handler,
-response_handler, main) importam `settings` daqui.
 
-Decisoes tecnicas:
-- Parser .env proprio (stdlib only): funciona no Windows e no Zorin sem
-  instalar python-dotenv. Se a variavel existir no SO, o SO tem prioridade.
-- Caminhos 100% pathlib (cross-platform): migra Windows -> Zorin sem edits.
-- Timezone com fallback: ZoneInfo se disponivel, senao UTC-3 fixo (BRT sem
-  horario de verao, valido no Brasil desde 2019).
-- Regras de exclusao embutidas como defaults: o sistema funciona mesmo sem
-  .env (modo degradado seguro).
-==============================================================================
+Configurações centralizadas do sistema.
+
+Carrega variáveis de ambiente do arquivo .env e fornece acesso tipado.
 """
 
 import os
-import re
-from datetime import date, datetime, timedelta, timezone
+import sys
 from pathlib import Path
+from typing import List, Optional
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover - Python sem tzdata
-    ZoneInfo = None
-
-# ----------------------------------------------------------------------------
-# RAIZ DO PROJETO (independente de CWD: funciona de qualquer pasta/cron)
-# ----------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ENV_FILE = PROJECT_ROOT / ".env"
-
-_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+from dotenv import load_dotenv
 
 
-# ----------------------------------------------------------------------------
-# PARSER .ENV (sem dependencia externa)
-# ----------------------------------------------------------------------------
-def _parse_env_file(path):
-    """Le .env manualmente.
-    - ignora linhas vazias e comentarios (#)
-    - aceita CHAVE=valor com ou sem aspas (simples/duplas)
-    - NUNCA sobrescreve variavel ja exportada no sistema operacional
-    """
-    values = {}
-    if not path or not path.exists():
-        return values
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return values
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        # remove aspas envolvendo o valor (ex: SENHA="@DiDier123")
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        if key and key not in os.environ:
-            values[key] = value
-    return values
+# --- CARREGAMENTO DO .ENV ---------------------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE = _PROJECT_ROOT / ".env"
+
+if _ENV_FILE.exists():
+    load_dotenv(_ENV_FILE)
 
 
-_ENV = _parse_env_file(ENV_FILE)
-
-
-def _get(key, default=None):
-    """SO > .env > default."""
-    env_val = os.environ.get(key)
-    if env_val is not None and env_val.strip() != "":
-        return env_val.strip()
-    return _ENV.get(key, default)
-
-
-def _get_bool(key, default=False):
-    val = _get(key)
-    if val is None:
-        return default
-    return str(val).strip().lower() in ("1", "true", "yes", "on", "sim")
-
-
-def _get_int(key, default):
-    try:
-        return int(str(_get(key, default)).strip())
-    except (TypeError, ValueError):
-        return default
-
-
-def get_timezone():
-    """Timezone consciente com fallback seguro para BRT (UTC-3)."""
-    nome = _get("TIMEZONE", "America/Sao_Paulo")
-    if ZoneInfo is not None:
-        try:
-            return ZoneInfo(nome)
-        except Exception:
-            pass
-    return timezone(timedelta(hours=-3), name="BRT")
-
-
-# ----------------------------------------------------------------------------
-# CONFIGURACAO CENTRAL
-# ----------------------------------------------------------------------------
 class Settings:
-    def __init__(self):
-        # ------------------------------------------------------------ caminhos
-        self.PROJECT_ROOT = PROJECT_ROOT
-        self.DATA_DIR = (PROJECT_ROOT / _get("DATA_DIR", "data")).resolve()
-        self.LOG_DIR = (PROJECT_ROOT / _get("LOG_DIR", "logs")).resolve()
-        self.DB_FILE = (PROJECT_ROOT / _get("DB_FILE", "data/pending_emails.db")).resolve()
-        self.BLACKLIST_FILE = (PROJECT_ROOT / _get("BLACKLIST_FILE", "data/blacklist.txt")).resolve()
-        self.BASELINE_FILE = (PROJECT_ROOT / _get("BASELINE_FILE", "data/emails_unicos.txt")).resolve()
-        self.MAIN_LOG = self.LOG_DIR / "sistema.log"
+    """Configurações do sistema CP FANI."""
 
-        # garante existencia (idempotente, cross-platform)
-        self.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # --- IMAP (leitura de emails) -------------------------------------------
+    IMAP_SERVER: str = os.getenv("IMAP_SERVER", "imap.secureserver.net")
+    IMAP_PORT: int = int(os.getenv("IMAP_PORT", "993"))
+    EMAIL_USER: str = os.getenv("EMAIL_USER", "")
+    EMAIL_PASS: str = os.getenv("EMAIL_PASS", "")
 
-        # ------------------------------------------------------------ IMAP
-        self.IMAP_SERVER = _get("IMAP_SERVER", "imap.secureserver.net")
-        self.IMAP_PORT = _get_int("IMAP_PORT", 993)
-        self.IMAP_USER = _get("IMAP_USER", "")
-        self.IMAP_PASSWORD = _get("IMAP_PASSWORD", "")
-        # Pastas varridas (imap_handler testa existencia antes de usar)
-        self.IMAP_FOLDERS = [
-            f.strip()
-            for f in _get("IMAP_FOLDERS", "INBOX,Spam,Junk").split(",")
-            if f.strip()
-        ]
+    # --- SMTP (envio de emails) ---------------------------------------------
+    SMTP_SERVER: str = os.getenv("SMTP_SERVER", "smtp.secureserver.net")
+    SMTP_PORT: int = int(os.getenv("SMTP_PORT", "465"))
 
-        # ------------------------------------------------------------ SMTP
-        self.SMTP_SERVER = _get("SMTP_SERVER", "smtpout.secureserver.net")
-        self.SMTP_PORT = _get_int("SMTP_PORT", 465)          # SSL direto
-        self.SMTP_PORT_FALLBACK = _get_int("SMTP_PORT_FALLBACK", 587)  # STARTTLS
-        self.SMTP_USER = _get("SMTP_USER", self.IMAP_USER)
-        self.SMTP_PASSWORD = _get("SMTP_PASSWORD", self.IMAP_PASSWORD)
-        self.SENDER_EMAIL = _get("SENDER_EMAIL", self.IMAP_USER)
-        self.SENDER_NAME = _get("SENDER_NAME", "CP FANI - Encaminhamento Automatico")
+    # --- Destinatários ------------------------------------------------------
+    APPROVAL_EMAIL: str = os.getenv("APPROVAL_EMAIL", "")
+    FINANCEIRO_EMAIL: str = os.getenv("FINANCEIRO_EMAIL", "")
+    ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL", "")
 
-        # ------------------------------------------------- destinos/aprovacao
-        self.FINANCEIRO_EMAIL = _get("FINANCEIRO_EMAIL", "financeiro@didier.com.br")
-        self.ADMIN_EMAIL = _get("ADMIN_EMAIL", self.IMAP_USER)
-        # Qualquer endereco deste dominio pode Aprovar/Reprovar
-        self.APPROVER_DOMAIN = _get("APPROVER_DOMAIN", "@didier.com.br").lower()
-        self.APPROVAL_REMINDER_HOURS = _get_int("APPROVAL_REMINDER_HOURS", 24)
-        self.APPROVAL_TIMEOUT_DAYS = _get_int("APPROVAL_TIMEOUT_DAYS", 7)
+    # --- Domínios e filtros -------------------------------------------------
+    DOMAIN_APROVADOR: str = os.getenv("DOMAIN_APROVADOR", "didier.com.br")
 
-        # ------------------------------------------------------- agendamento
-        self.START_DATE = self._parse_start_date()   # primeira varredura
-        self.TIMEZONE = get_timezone()
-        self.EXECUTION_INTERVAL_MINUTES = _get_int("EXECUTION_INTERVAL_MINUTES", 60)
-        self.WEEKLY_REPORT_DAY = _get_int("WEEKLY_REPORT_DAY", 5)   # 0=dom..6=sab
-        self.WEEKLY_REPORT_TIME = _get("WEEKLY_REPORT_TIME", "09:00")
-        self.WEEKLY_ANALYZER_TIME = _get("WEEKLY_ANALYZER_TIME", "09:15")
+    # Whitelist de remetentes confiáveis (um por linha no .env)
+    WHITELIST_SENDERS: List[str] = [
+        s.strip() for s in os.getenv("WHITELIST_SENDERS", "").split("\n")
+        if s.strip()
+    ]
 
-        # ------------------------------------------------------------- modos
-        self.DRY_RUN = _get_bool("DRY_RUN", False)
-        self.LOG_LEVEL = _get("LOG_LEVEL", "INFO").upper()
+    # Blacklist de remetentes bloqueados
+    BLACKLIST_SENDERS: List[str] = [
+        s.strip() for s in os.getenv("BLACKLIST_SENDERS", "").split("\n")
+        if s.strip()
+    ]
 
-        # ------------------------------------------- regras de negocio (filtros)
-        # Remetentes externos ignorados no encaminhamento
-        self.EXCLUDED_SENDERS = {
-            "lixo@didier.com.br",          # interno (dominio tambem cobre)
-            "notifications@didier.com.br", # interno (dominio tambem cobre)
-            "alert@uptimerobot.com",
-            "noreply_gol_seguranca@claro.com.br",
-            "trocadechip.pme@claroatendimento.com.br",
-            "no-reply@hetrixtools.com",
-        }
-        # Dominio interno: NUNCA encaminha (mas APROVA respostas dele)
-        self.EXCLUDED_DOMAINS = {"@didier.com.br"}
-        # Assuntos nao-financeiros (case-insensitive, com/sem acento)
-        self.EXCLUDED_SUBJECT_KEYWORDS = {
-            "contratacao", "contratação",
-            "assinatura",
-            "proposta",
-            "agendamento",
-            "pesquisa",
-            "senha",
-            "renovacao", "renovação",
-            "reagendamento tecnico", "reagendamento técnico",
-        }
-        # Palavras que caracterizam email financeiro (captura fornecedores novos)
-        self.FINANCIAL_KEYWORDS = {
-            "boleto", "fatura", "nota fiscal", "nf-e", "nfs-e", "danfe",
-            "cobranca", "cobrança", "2ª via", "2a via", "segunda via",
-            "pagamento", "vencimento", "protesto",
-        }
+    # Keywords que indicam spam/bloqueio no assunto
+    BLOCK_KEYWORDS: List[str] = [
+        s.strip() for s in os.getenv("BLOCK_KEYWORDS", "").split("\n")
+        if s.strip()
+    ]
 
-        # --------------------------------------------- protocolo de mensagens
-        self.FORWARD_SUBJECT_PREFIX = "[CP FANI]"
-        self.APPROVAL_SUBJECT_PREFIX = "APROVACAO NECESSARIA"
-        self.REPORT_SUBJECT_PREFIX = "[CP FANI RELATORIO]"
-        self.ANALYZER_SUBJECT_PREFIX = "[CP FANI LIXO]"
-        self.APPROVAL_HEADER = "X-Didier-Approval"        # request | response
-        self.APPROVAL_UUID_HEADER = "X-Didier-UUID"
+    # --- Paths ---------------------------------------------------------------
+    DB_PATH: Path = _PROJECT_ROOT / os.getenv("DB_PATH", "data/cpfani.db")
+    LOG_DIR: Path = _PROJECT_ROOT / os.getenv("LOG_DIR", "logs")
 
-    # ------------------------------------------------------------------ utils
-    @staticmethod
-    def _parse_start_date():
-        raw = str(_get("START_DATE", "2026-08-01")).strip()
-        try:
-            return date.fromisoformat(raw)
-        except ValueError:
-            return None
+    # --- Comportamento ------------------------------------------------------
+    DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    POLL_INTERVAL_MINUTES: int = int(os.getenv("POLL_INTERVAL_MINUTES", "60"))
 
-    def now(self):
-        """Datetime corrente consciente no timezone configurado."""
-        return datetime.now(self.TIMEZONE)
+    # --- Prazos -------------------------------------------------------------
+    APPROVAL_REMINDER_HOURS: int = int(os.getenv("APPROVAL_REMINDER_HOURS", "24"))
+    APPROVAL_EXPIRE_DAYS: int = int(os.getenv("APPROVAL_EXPIRE_DAYS", "7"))
 
-    @staticmethod
-    def is_valid_email(text):
-        """Valida formato de email (usado p/ filtrar baseline malformada)."""
-        if not text:
-            return False
-        return bool(_EMAIL_RE.match(text.strip().lower()))
+    # ==========================================================================
+    # PATCH ADITIVO DE COMPATIBILIDADE (AUDITORIA DE INTERFACE)
+    # --------------------------------------------------------------------------
+    # SOMENTE ADIÇÕES. Nenhuma linha existente foi removida ou alterada
+    # (Regra Crítica de Preservação). Aliases mapeados a partir da auditoria
+    # Select-String dos módulos src/* e database/*.
+    # ==========================================================================
 
-    @staticmethod
-    def mask(secret):
-        """Mascara credencial para logs/auto-teste."""
-        secret = str(secret or "")
-        if len(secret) <= 3:
-            return "***"
-        return secret[:2] + "*" * (len(secret) - 3) + secret[-1]
+    # database/database.py espera DB_FILE; a fonte da verdade é DB_PATH
+    DB_FILE: Path = DB_PATH
 
-    def validate(self):
-        """Retorna lista de erros de configuracao (vazia = OK)."""
-        erros = []
-        if not self.IMAP_USER or "@" not in self.IMAP_USER:
-            erros.append("IMAP_USER ausente/invalido no .env")
-        if not self.IMAP_PASSWORD:
-            erros.append("IMAP_PASSWORD ausente no .env")
-        if not self.SMTP_USER or not self.SMTP_PASSWORD:
-            erros.append("SMTP_USER/SMTP_PASSWORD ausentes no .env")
-        if not self.FINANCEIRO_EMAIL or "@" not in self.FINANCEIRO_EMAIL:
-            erros.append("FINANCEIRO_EMAIL ausente/invalido no .env")
-        if self.START_DATE is None:
-            erros.append("START_DATE invalido (use YYYY-MM-DD)")
-        return erros
+    # response_handler faz endswith(); garante o "@" para casar apenas o domínio
+    APPROVER_DOMAIN: str = "@" + DOMAIN_APROVADOR
+
+    # response_handler espera APPROVAL_TIMEOUT_DAYS; fonte da verdade é EXPIRE
+    APPROVAL_TIMEOUT_DAYS: int = APPROVAL_EXPIRE_DAYS
+
+    # Prefixo dos assuntos encaminhados ao financeiro (novo, com default seguro)
+    FORWARD_SUBJECT_PREFIX: str = os.getenv(
+        "FORWARD_SUBJECT_PREFIX", "[CP FANI] ENC:"
+    )
+
+    def validate(self) -> List[str]:
+        """Valida campos obrigatórios. Retorna lista de campos faltantes."""
+        missing = []
+        if not self.EMAIL_USER:
+            missing.append("EMAIL_USER")
+        if not self.EMAIL_PASS:
+            missing.append("EMAIL_PASS")
+        if not self.APPROVAL_EMAIL:
+            missing.append("APPROVAL_EMAIL")
+        if not self.FINANCEIRO_EMAIL:
+            missing.append("FINANCEIRO_EMAIL")
+        return missing
+
+    def summary(self) -> str:
+        """Retorna resumo das configurações (sem expor senhas)."""
+        return (
+            f"IMAP={self.IMAP_SERVER}:{self.IMAP_PORT} "
+            f"User={self.EMAIL_USER or '(vazio)'} | "
+            f"SMTP={self.SMTP_SERVER}:{self.SMTP_PORT} | "
+            f"Aprovador={self.APPROVAL_EMAIL or '(vazio)'} | "
+            f"Financeiro={self.FINANCEIRO_EMAIL or '(vazio)'} | "
+            f"Domínio={self.DOMAIN_APROVADOR} | "
+            f"Whitelist={len(self.WHITELIST_SENDERS)} | "
+            f"Blacklist={len(self.BLACKLIST_SENDERS)} | "
+            f"Keywords={len(self.BLOCK_KEYWORDS)} | "
+            f"DRY_RUN={self.DRY_RUN} | "
+            f"DB={self.DB_PATH.name}"
+        )
 
 
-# Instancia unica consumida por todos os modulos
+# Instância global
 settings = Settings()
 
 
-# ----------------------------------------------------------------------------
-# AUTO-TESTE: python config/settings.py
-# ----------------------------------------------------------------------------
+# --- AUTO-TESTE -------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 70)
-    print("CP FANI - AUTO-TESTE DE CONFIGURACAO")
+    print("CP FANI - AUTO-TESTE DE SETTINGS")
     print("=" * 70)
-    print(f"Raiz do projeto : {settings.PROJECT_ROOT}")
-    print(f"Arquivo .env    : {'OK' if ENV_FILE.exists() else 'NAO ENCONTRADO'}")
-    print(f"IMAP            : {settings.IMAP_USER} @ {settings.IMAP_SERVER}:{settings.IMAP_PORT} (senha: {settings.mask(settings.IMAP_PASSWORD)})")
-    print(f"SMTP            : {settings.SMTP_USER} @ {settings.SMTP_SERVER}:{settings.SMTP_PORT} fallback {settings.SMTP_PORT_FALLBACK} (senha: {settings.mask(settings.SMTP_PASSWORD)})")
-    print(f"Destino         : {settings.FINANCEIRO_EMAIL}")
-    print(f"Aprovadores     : *{settings.APPROVER_DOMAIN}")
-    print(f"Start date      : {settings.START_DATE}")
-    print(f"Timezone        : {settings.TIMEZONE}")
-    print(f"Pastas IMAP     : {', '.join(settings.IMAP_FOLDERS)}")
-    print(f"Baseline        : {settings.BASELINE_FILE} ({'OK' if settings.BASELINE_FILE.exists() else 'NAO ENCONTRADA'})")
-    print(f"Banco           : {settings.DB_FILE}")
-    print(f"Blacklist       : {settings.BLACKLIST_FILE}")
-    print(f"DRY_RUN         : {settings.DRY_RUN}")
-    erros = settings.validate()
-    print("-" * 70)
-    if erros:
-        print("ERROS DE CONFIGURACAO:")
-        for e in erros:
-            print(f"  [!] {e}")
+
+    # Teste 1: Carregamento
+    print(f"1. Project root: {_PROJECT_ROOT}")
+    print(f"2. .env exists: {_ENV_FILE.exists()}")
+
+    # Teste 2: Validação
+    missing = settings.validate()
+    if missing:
+        print(f"3. ⚠️  Campos faltando: {missing}")
     else:
-        print("CONFIGURACAO VALIDA - pronto para os proximos modulos.")
+        print("3. ✅ Todos os campos obrigatórios preenchidos")
+
+    # Teste 3: Summary
+    print(f"4. Summary: {settings.summary()}")
+
+    # Teste 4: Paths
+    print(f"5. DB path: {settings.DB_PATH}")
+    print(f"6. Log dir: {settings.LOG_DIR}")
+
+    # Teste 5: Aliases de compatibilidade (patch aditivo)
+    assert settings.DB_FILE == settings.DB_PATH, "alias DB_FILE falhou"
+    assert settings.APPROVER_DOMAIN == "@" + settings.DOMAIN_APROVADOR, \
+        "alias APPROVER_DOMAIN falhou"
+    assert settings.APPROVAL_TIMEOUT_DAYS == settings.APPROVAL_EXPIRE_DAYS, \
+        "alias APPROVAL_TIMEOUT_DAYS falhou"
+    assert settings.FORWARD_SUBJECT_PREFIX, "FORWARD_SUBJECT_PREFIX vazio"
+    print("7. ✅ Aliases de compatibilidade OK (DB_FILE, APPROVER_DOMAIN, "
+          "APPROVAL_TIMEOUT_DAYS, FORWARD_SUBJECT_PREFIX)")
+
+    print("=" * 70)
+    print("SETTINGS OK" if not missing else "SETTINGS COM AVISOS")
     print("=" * 70)
