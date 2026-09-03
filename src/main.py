@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-==============================================================================
 SISTEMA DE ENCAMINHAMENTO DE EMAILS - CP FANI
 Arquivo: src/main.py
-==============================================================================
 Orquestrador principal do sistema.
 
 Modos de operacao:
--单次 execucao (via cron): python src/main.py
+- Execucao unica (via cron): python src/main.py
 - Modo continuo (daemon): python src/main.py --continuous
 - Modo DRY_RUN: DRY_RUN=true python src/main.py
 - Relatorio semanal: python src/main.py --weekly-report
@@ -20,11 +18,10 @@ Pipeline:
 5. Envia emails de aprovacao com SMTPHandler
 6. Processa respostas com ResponseHandler
 7. Cleanup de registros antigos (>90 dias)
-
 ==============================================================================
 """
-
 import sys
+import time
 import signal
 import argparse
 import logging
@@ -32,11 +29,13 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 
+
 # --- FIX DE PATH (EXECUCAO STANDALONE) -----------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 # -------------------------------------------------------------------------
+
 
 from config.settings import settings
 from database.database import db
@@ -51,9 +50,7 @@ from src.response_handler import ResponseHandler
 def setup_logging():
     """Configura logging estruturado (console + arquivo)."""
     settings.LOG_DIR.mkdir(parents=True, exist_ok=True)
-    
     log_file = settings.LOG_DIR / f"cpfani_{datetime.now():%Y%m%d}.log"
-    
     logging.basicConfig(
         level=getattr(logging, settings.LOG_LEVEL),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -62,7 +59,6 @@ def setup_logging():
             logging.StreamHandler(sys.stdout),
         ],
     )
-    
     # Reduz verbosidade de libs externas
     logging.getLogger("imaplib").setLevel(logging.WARNING)
     logging.getLogger("smtplib").setLevel(logging.WARNING)
@@ -71,33 +67,33 @@ def setup_logging():
 # --- GRACEFUL SHUTDOWN -----------------------------------------------------
 class GracefulShutdown:
     """Captura sinais de terminacao para fechar conexoes limpo."""
-    
+
     def __init__(self):
         self.shutdown_requested = False
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-    
+
     def _signal_handler(self, signum, frame):
         logging.warning(f"Sinal {signum} recebido. Encerrando apos ciclo atual...")
         self.shutdown_requested = True
 
 
 # --- PIPELINE PRINCIPAL ----------------------------------------------------
-class CPFaníPipeline:
+class CPFaniPipeline:
     """Orquestrador do pipeline de processamento de emails."""
-    
-    def __init__(self, dry_run: bool = False):
+
+    def __init__(self, dry_run: bool = False, database=None):
         self.dry_run = dry_run or settings.DRY_RUN
+        self.db = database if database is not None else db
         self.imap = IMAPHandler()
-        self.filter_engine = FilterEngine(database=db)
-        self.button_handler = ButtonHandler(database=db)
+        self.filter_engine = FilterEngine(database=self.db)
+        self.button_handler = ButtonHandler(database=self.db)
         self.smtp = SMTPHandler()
         self.response_handler = ResponseHandler(
-            imap=self.imap, smtp=self.smtp, database=db
+            imap=self.imap, smtp=self.smtp, database=self.db
         )
-        
         logging.info(f"Pipeline inicializado (DRY_RUN={self.dry_run})")
-    
+
     def run_once(self) -> Dict[str, int]:
         """Executa o pipeline uma vez. Retorna estatisticas."""
         stats = {
@@ -108,20 +104,19 @@ class CPFaníPipeline:
             "respostas_processadas": 0,
             "erros": 0,
         }
-        
         try:
             # 1. Conecta IMAP
             if not self.imap.connect():
                 logging.error("Falha ao conectar IMAP")
                 stats["erros"] += 1
                 return stats
-            
+
             # 2. Busca emails nao lidos
             logging.info("Buscando emails nao lidos...")
             emails = self.imap.fetch_unseen_emails()
             stats["emails_fetchados"] = len(emails)
             logging.info(f"Encontrados {len(emails)} emails nao lidos")
-            
+
             # 3. Aplica filtro
             logging.info("Aplicando filtro...")
             filtered = self.filter_engine.filter_emails(emails)
@@ -131,7 +126,7 @@ class CPFaníPipeline:
                 f"{len(filtered['pendentes'])} pendentes, "
                 f"{len(filtered['bloqueados'])} bloqueados"
             )
-            
+
             # 4. Para emails pendentes: gera botoes de aprovacao
             if filtered["pendentes"]:
                 logging.info(f"Gerando botoes para {len(filtered['pendentes'])} emails...")
@@ -143,10 +138,10 @@ class CPFaníPipeline:
                     except Exception as e:
                         logging.error(f"Erro ao criar aprovacao: {e}")
                         stats["erros"] += 1
-            
+
             # 5. Envia emails de aprovacao (se nao for DRY_RUN)
             if not self.dry_run:
-                pending_approvals = db.get_pending_approvals(only_pending=True)
+                pending_approvals = self.db.get_pending_approvals(only_pending=True)
                 logging.info(f"Enviando {len(pending_approvals)} emails de aprovacao...")
                 for approval in pending_approvals:
                     try:
@@ -159,13 +154,13 @@ class CPFaníPipeline:
                             )
                             if success:
                                 stats["emails_enviados"] += 1
-                                db.mark_approval_sent(approval["uuid"])
+                                self.db.mark_approval_sent(approval["uuid"])
                     except Exception as e:
                         logging.error(f"Erro ao enviar aprovacao: {e}")
                         stats["erros"] += 1
             else:
                 logging.info("[DRY_RUN] Pulando envio de emails")
-            
+
             # 6. Processa respostas (APROVAR_/REPROVAR_)
             logging.info("Processando respostas...")
             response_stats = self.response_handler.process_responses()
@@ -179,29 +174,28 @@ class CPFaníPipeline:
                 f"{response_stats['reprovados']} reprovados, "
                 f"{response_stats['invalidos']} invalidos"
             )
-            
+
             # 7. Forward imediato de emails aprovados
             if not self.dry_run:
                 self._forward_approved_emails()
-            
+
             # 8. Cleanup de registros antigos
             self._cleanup_old_records()
-            
+
         except Exception as e:
             logging.error(f"Erro no pipeline: {e}", exc_info=True)
             stats["erros"] += 1
         finally:
             self.imap.disconnect()
-        
+
         return stats
-    
+
     def _get_original_email(self, approval: Dict) -> Optional[Dict]:
         """Re-busca email original do IMAP via Message-ID."""
         try:
             mid = approval.get("message_id")
             if not mid:
                 return None
-            
             # Busca por Message-ID
             emails = self.imap.search_by_message_id(mid)
             if emails:
@@ -209,13 +203,12 @@ class CPFaníPipeline:
         except Exception as e:
             logging.error(f"Erro ao buscar email original: {e}")
         return None
-    
+
     def _forward_approved_emails(self):
         """Encaminha emails aprovados para o financeiro."""
-        approved = db.get_approved_not_forwarded()
+        approved = self.db.get_approved_not_forwarded()
         if not approved:
             return
-        
         logging.info(f"Encaminhando {len(approved)} emails aprovados...")
         for approval in approved:
             try:
@@ -226,26 +219,25 @@ class CPFaníPipeline:
                         to_email=settings.FINANCEIRO_EMAIL,
                     )
                     if success:
-                        db.mark_as_forwarded(approval["uuid"])
+                        self.db.mark_as_forwarded(approval["uuid"])
                         logging.info(f"Email encaminhado: {approval['subject']}")
             except Exception as e:
                 logging.error(f"Erro ao encaminhar: {e}")
-    
+
     def _cleanup_old_records(self):
         """Remove registros antigos do banco (>90 dias)."""
         try:
             cutoff = datetime.now() - timedelta(days=90)
-            deleted = db.cleanup_old_approvals(cutoff)
+            deleted = self.db.cleanup_old_approvals(cutoff)
             if deleted > 0:
                 logging.info(f"Cleanup: {deleted} registros removidos (>90 dias)")
         except Exception as e:
             logging.error(f"Erro no cleanup: {e}")
-    
+
     def run_continuous(self, shutdown: GracefulShutdown):
         """Roda em modo continuo (daemon) com polling."""
         interval = settings.POLL_INTERVAL_MINUTES * 60
         logging.info(f"Modo continuo iniciado (intervalo: {settings.POLL_INTERVAL_MINUTES}min)")
-        
         while not shutdown.shutdown_requested:
             stats = self.run_once()
             logging.info(
@@ -253,13 +245,11 @@ class CPFaníPipeline:
                 f"{stats['aprovacoes_geradas']} aprovacoes, "
                 f"{stats['respostas_processadas']} respostas"
             )
-            
             # Aguarda proximo ciclo (com verificacao de shutdown)
             for _ in range(interval):
                 if shutdown.shutdown_requested:
                     break
                 time.sleep(1)
-        
         logging.info("Shutdown completo")
 
 
@@ -267,37 +257,27 @@ class CPFaníPipeline:
 def generate_weekly_report():
     """Gera relatorio semanal de estatisticas."""
     logging.info("Gerando relatorio semanal...")
-    
     cutoff = datetime.now() - timedelta(days=7)
     stats = db.get_weekly_stats(cutoff)
-    
     report = f"""
 ================================================================================
 RELATORIO SEMANAL - CP FANI
 Periodo: {cutoff:%d/%m/%Y} a {datetime.now():%d/%m/%Y}
-================================================================================
-
 RESUMO GERAL:
-- Emails processados: {stats['total_emails']}
-- Aprovacoes solicitadas: {stats['approvals_requested']}
-- Aprovacoes aprovadas: {stats['approvals_approved']}
-- Aprovacoes reprovadas: {stats['approvals_rejected']}
-- Emails encaminhados: {stats['emails_forwarded']}
-
+Emails processados: {stats['total_emails']}
+Aprovacoes solicitadas: {stats['approvals_requested']}
+Aprovacoes aprovadas: {stats['approvals_approved']}
+Aprovacoes reprovadas: {stats['approvals_rejected']}
+Emails encaminhados: {stats['emails_forwarded']}
 TOP 5 REMETENTES (WHITELIST):
 {chr(10).join(f"  {i+1}. {s}: {c} emails" for i, (s, c) in enumerate(stats['top_whitelist'][:5]))}
-
 TOP 5 REMETENTES (BLACKLIST):
 {chr(10).join(f"  {i+1}. {s}: {c} emails" for i, (s, c) in enumerate(stats['top_blacklist'][:5]))}
-
 TAXA DE APROVACAO:
-  {(stats['approvals_approved'] / max(stats['approvals_requested'], 1) * 100):.1f}%
-
+{(stats['approvals_approved'] / max(stats['approvals_requested'], 1) * 100):.1f}%
 ================================================================================
 """
-    
     print(report)
-    
     # Envia por email se nao for DRY_RUN
     if not settings.DRY_RUN:
         try:
@@ -333,35 +313,34 @@ def main():
         action="store_true",
         help="Modo teste (nao envia emails)",
     )
-    
     args = parser.parse_args()
-    
+
     # Setup
     setup_logging()
     shutdown = GracefulShutdown()
-    
+
     logging.info("=" * 70)
     logging.info("CP FANI - Sistema de Encaminhamento de Emails")
     logging.info("=" * 70)
     logging.info(f"Config: {settings.summary()}")
-    
+
     # Valida credenciais
     missing = settings.validate()
     if missing and not args.dry_run:
         logging.error(f"Campos obrigatorios faltando: {missing}")
         sys.exit(1)
-    
+
     # Executa comando
     if args.weekly_report:
         generate_weekly_report()
     else:
-        pipeline = CPfaníPipeline(dry_run=args.dry_run)
+        pipeline = CPFaniPipeline(dry_run=args.dry_run, database=db)
         if args.continuous:
             pipeline.run_continuous(shutdown)
         else:
             stats = pipeline.run_once()
             logging.info(f"Estatisticas finais: {stats}")
-    
+
     logging.info("Execucao concluida")
 
 
