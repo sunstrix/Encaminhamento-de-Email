@@ -6,6 +6,11 @@ Arquivo: config/settings.py
 Configurações centralizadas do sistema.
 
 Carrega variáveis de ambiente do arquivo .env e fornece acesso tipado.
+
+Histórico de patches (Fase 2 — auditoria Claude):
+- #4: Leitura dupla IMAP_USER/SMTP_USER com fallback para EMAIL_USER
+- #5: Fallback APPROVAL_EMAIL -> SENDER_EMAIL -> EMAIL_USER
+- #6: Leitura de DB_FILE como fonte primária, DB_PATH como fallback
 """
 
 import os
@@ -24,21 +29,57 @@ if _ENV_FILE.exists():
     load_dotenv(_ENV_FILE)
 
 
+def _env_or(*keys: str, default: str = "") -> str:
+    """Retorna o valor da primeira variável de ambiente não-vazia entre `keys`.
+
+    Útil para unificar nomes divergentes entre .env e código sem quebrar
+    interfaces existentes.
+    """
+    for key in keys:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return default
+
+
 class Settings:
     """Configurações do sistema CP FANI."""
 
-    # --- IMAP (leitura de emails) -------------------------------------------
+    # =========================================================================
+    # IMAP (leitura de emails) — Bug #4
+    # ---------------------------------------------------------------------------
+    # Fonte primária: IMAP_USER/IMAP_PASS (nomenclatura real do .env)
+    # Fallback:       EMAIL_USER/EMAIL_PASS (nomenclatura legada do código)
+    # =========================================================================
     IMAP_SERVER: str = os.getenv("IMAP_SERVER", "imap.secureserver.net")
     IMAP_PORT: int = int(os.getenv("IMAP_PORT", "993"))
-    EMAIL_USER: str = os.getenv("EMAIL_USER", "")
-    EMAIL_PASS: str = os.getenv("EMAIL_PASS", "")
 
-    # --- SMTP (envio de emails) ---------------------------------------------
+    EMAIL_USER: str = _env_or("IMAP_USER", "EMAIL_USER", default="")
+    EMAIL_PASS: str = _env_or("IMAP_PASS", "EMAIL_PASS", default="")
+
+    # =========================================================================
+    # SMTP (envio de emails) — Bug #4
+    # ---------------------------------------------------------------------------
+    # Fonte primária: SMTP_USER/SMTP_PASS (permite conta SMTP diferente do IMAP)
+    # Fallback:       IMAP_USER/EMAIL_USER (mesma conta para leitura e envio)
+    # =========================================================================
     SMTP_SERVER: str = os.getenv("SMTP_SERVER", "smtp.secureserver.net")
     SMTP_PORT: int = int(os.getenv("SMTP_PORT", "465"))
 
-    # --- Destinatários ------------------------------------------------------
-    APPROVAL_EMAIL: str = os.getenv("APPROVAL_EMAIL", "")
+    SMTP_USER: str = _env_or("SMTP_USER", "IMAP_USER", "EMAIL_USER", default="")
+    SMTP_PASS: str = _env_or("SMTP_PASS", "IMAP_PASS", "EMAIL_PASS", default="")
+
+    # =========================================================================
+    # Destinatários — Bug #5
+    # ---------------------------------------------------------------------------
+    # APPROVAL_EMAIL com fallback em cascata:
+    #   1) APPROVAL_EMAIL (se explicitamente definido)
+    #   2) SENDER_EMAIL   (identidade de envio da organização)
+    #   3) EMAIL_USER     (própria conta IMAP, para ambientes de teste)
+    # =========================================================================
+    APPROVAL_EMAIL: str = _env_or(
+        "APPROVAL_EMAIL", "SENDER_EMAIL", "IMAP_USER", "EMAIL_USER", default=""
+    )
     FINANCEIRO_EMAIL: str = os.getenv("FINANCEIRO_EMAIL", "")
     ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL", "")
 
@@ -63,8 +104,14 @@ class Settings:
         if s.strip()
     ]
 
-    # --- Paths ---------------------------------------------------------------
-    DB_PATH: Path = _PROJECT_ROOT / os.getenv("DB_PATH", "data/cpfani.db")
+    # =========================================================================
+    # Paths — Bug #6
+    # ---------------------------------------------------------------------------
+    # Fonte primária: DB_FILE (nomenclatura real do .env)
+    # Fallback:       DB_PATH (nomenclatura legada do código)
+    # =========================================================================
+    _DB_RELATIVE: str = _env_or("DB_FILE", "DB_PATH", default="data/cpfani.db")
+    DB_PATH: Path = _PROJECT_ROOT / _DB_RELATIVE
     LOG_DIR: Path = _PROJECT_ROOT / os.getenv("LOG_DIR", "logs")
 
     # --- Comportamento ------------------------------------------------------
@@ -76,24 +123,22 @@ class Settings:
     APPROVAL_REMINDER_HOURS: int = int(os.getenv("APPROVAL_REMINDER_HOURS", "24"))
     APPROVAL_EXPIRE_DAYS: int = int(os.getenv("APPROVAL_EXPIRE_DAYS", "7"))
 
-    # ==========================================================================
-    # PATCH ADITIVO DE COMPATIBILIDADE (AUDITORIA DE INTERFACE)
-    # --------------------------------------------------------------------------
-    # SOMENTE ADIÇÕES. Nenhuma linha existente foi removida ou alterada
-    # (Regra Crítica de Preservação). Aliases mapeados a partir da auditoria
-    # Select-String dos módulos src/* e database/*.
-    # ==========================================================================
+    # =========================================================================
+    # PATCH ADITIVO DE COMPATIBILIDADE (AUDITORIA DE INTERFACE — FASE 1)
+    # ---------------------------------------------------------------------------
+    # Aliases mantidos. Nenhum método existente foi removido.
+    # =========================================================================
 
-    # database/database.py espera DB_FILE; a fonte da verdade é DB_PATH
+    # database/database.py espera DB_FILE; fonte da verdade é DB_PATH
     DB_FILE: Path = DB_PATH
 
-    # response_handler faz endswith(); garante o "@" para casar apenas o domínio
+    # response_handler faz endswith(); garante o "@" para casar só o domínio
     APPROVER_DOMAIN: str = "@" + DOMAIN_APROVADOR
 
     # response_handler espera APPROVAL_TIMEOUT_DAYS; fonte da verdade é EXPIRE
     APPROVAL_TIMEOUT_DAYS: int = APPROVAL_EXPIRE_DAYS
 
-    # Prefixo dos assuntos encaminhados ao financeiro (novo, com default seguro)
+    # Prefixo dos assuntos encaminhados ao financeiro
     FORWARD_SUBJECT_PREFIX: str = os.getenv(
         "FORWARD_SUBJECT_PREFIX", "[CP FANI] ENC:"
     )
@@ -102,21 +147,35 @@ class Settings:
         """Valida campos obrigatórios. Retorna lista de campos faltantes."""
         missing = []
         if not self.EMAIL_USER:
-            missing.append("EMAIL_USER")
+            missing.append("EMAIL_USER (ou IMAP_USER)")
         if not self.EMAIL_PASS:
-            missing.append("EMAIL_PASS")
+            missing.append("EMAIL_PASS (ou IMAP_PASS)")
+        if not self.SMTP_USER:
+            missing.append("SMTP_USER (ou IMAP_USER/EMAIL_USER)")
+        if not self.SMTP_PASS:
+            missing.append("SMTP_PASS (ou IMAP_PASS/EMAIL_PASS)")
         if not self.APPROVAL_EMAIL:
-            missing.append("APPROVAL_EMAIL")
+            missing.append(
+                "APPROVAL_EMAIL (ou SENDER_EMAIL/EMAIL_USER como fallback)"
+            )
         if not self.FINANCEIRO_EMAIL:
             missing.append("FINANCEIRO_EMAIL")
         return missing
 
     def summary(self) -> str:
         """Retorna resumo das configurações (sem expor senhas)."""
+        smtp_same_as_imap = (
+            self.SMTP_USER == self.EMAIL_USER and self.SMTP_PASS == self.EMAIL_PASS
+        )
+        smtp_label = self.SMTP_USER or "(vazio)"
+        if smtp_same_as_imap and self.SMTP_USER:
+            smtp_label += " (mesma do IMAP)"
+
         return (
             f"IMAP={self.IMAP_SERVER}:{self.IMAP_PORT} "
             f"User={self.EMAIL_USER or '(vazio)'} | "
-            f"SMTP={self.SMTP_SERVER}:{self.SMTP_PORT} | "
+            f"SMTP={self.SMTP_SERVER}:{self.SMTP_PORT} "
+            f"User={smtp_label} | "
             f"Aprovador={self.APPROVAL_EMAIL or '(vazio)'} | "
             f"Financeiro={self.FINANCEIRO_EMAIL or '(vazio)'} | "
             f"Domínio={self.DOMAIN_APROVADOR} | "
@@ -135,7 +194,7 @@ settings = Settings()
 # --- AUTO-TESTE -------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 70)
-    print("CP FANI - AUTO-TESTE DE SETTINGS")
+    print("CP FANI - AUTO-TESTE DE SETTINGS (Fase 2)")
     print("=" * 70)
 
     # Teste 1: Carregamento
@@ -156,15 +215,24 @@ if __name__ == "__main__":
     print(f"5. DB path: {settings.DB_PATH}")
     print(f"6. Log dir: {settings.LOG_DIR}")
 
-    # Teste 5: Aliases de compatibilidade (patch aditivo)
+    # Teste 5: Aliases de compatibilidade (Fase 1)
     assert settings.DB_FILE == settings.DB_PATH, "alias DB_FILE falhou"
     assert settings.APPROVER_DOMAIN == "@" + settings.DOMAIN_APROVADOR, \
         "alias APPROVER_DOMAIN falhou"
     assert settings.APPROVAL_TIMEOUT_DAYS == settings.APPROVAL_EXPIRE_DAYS, \
         "alias APPROVAL_TIMEOUT_DAYS falhou"
     assert settings.FORWARD_SUBJECT_PREFIX, "FORWARD_SUBJECT_PREFIX vazio"
-    print("7. ✅ Aliases de compatibilidade OK (DB_FILE, APPROVER_DOMAIN, "
+    print("7. ✅ Aliases Fase 1 OK (DB_FILE, APPROVER_DOMAIN, "
           "APPROVAL_TIMEOUT_DAYS, FORWARD_SUBJECT_PREFIX)")
+
+    # Teste 6: Correções da Fase 2 (Claude)
+    print("-" * 70)
+    print("CORREÇÕES FASE 2 (Claude):")
+    print(f"  #4 IMAP_USER  -> EMAIL_USER = {settings.EMAIL_USER or '(vazio)'}")
+    print(f"  #4 SMTP_USER  -> SMTP_USER  = {settings.SMTP_USER or '(vazio)'}")
+    print(f"  #5 APPROVAL_EMAIL (fallback) = {settings.APPROVAL_EMAIL or '(vazio)'}")
+    print(f"  #6 DB_FILE    -> DB_PATH    = {settings.DB_PATH.name}")
+    print("-" * 70)
 
     print("=" * 70)
     print("SETTINGS OK" if not missing else "SETTINGS COM AVISOS")
