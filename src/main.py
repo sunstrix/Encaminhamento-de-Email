@@ -4,11 +4,12 @@ SISTEMA DE ENCAMINHAMENTO DE EMAILS - CP FANI
 Arquivo: src/main.py
 Orquestrador principal do sistema.
 
-Refatoração Qwen (Arquivo 3):
-- Correção de sintaxe: Path(__file__) e __name__
-- Adição de flag --test-connection para diagnóstico de rede
-- Alinhamento de interface com IMAPHandler e FilterEngine
-- Remoção de chamadas a métodos inexistentes nos handlers
+Correções Qwen (Fase 3 - Bugs Críticos):
+- Remoção da chamada fantasma `filter_emails` (o IMAPHandler já filtra e retorna a decisão).
+- Correção do loop de processamento para usar a chave `decision` retornada pelo IMAP.
+- Remoção de qualquer injeção manual de `settings.BLACKLIST_SENDERS` (FilterEngine gerencia via arquivo).
+- Encaminhamento imediato de emails com decision FORWARD para o financeiro.
+- Integração robusta com ResponseHandler para processar APROVAR_/REPROVAR_.
 """
 import sys
 import time
@@ -78,7 +79,7 @@ class CPFaniPipeline:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run or settings.DRY_RUN
         self.imap = IMAPHandler()
-        # FilterEngine e ButtonHandler nao aceitam argumentos no __init__
+        # FilterEngine e ButtonHandler nao aceitam 'database' no __init__
         self.filter_engine = FilterEngine()
         self.button_handler = ButtonHandler()
         self.smtp = SMTPHandler()
@@ -107,10 +108,10 @@ class CPFaniPipeline:
         # Teste SMTP
         try:
             logging.info("Testando conexão SMTP...")
-            # O SMTPHandler não tem método de teste nativo, então tentamos uma conexão simples
             import smtplib
             with smtplib.SMTP(settings.SMTP_SERVER, settings.SMTP_PORT, timeout=10) as server:
-                server.starttls() if settings.SMTP_PORT == 587 else None
+                if settings.SMTP_PORT == 587:
+                    server.starttls()
                 server.login(settings.SMTP_USER, settings.SMTP_PASS)
                 logging.info("✅ SMTP: Conexão e autenticação bem-sucedidas.")
         except Exception as e:
@@ -137,122 +138,151 @@ class CPFaniPipeline:
                 stats["erros"] += 1
                 return stats
 
-            # 2. Busca e processa emails nao lidos (IMAPHandler já aplica o filtro)
-            logging.info("Buscando emails nao lidos...")
+            # 2. Busca emails nao lidos 
+            # O IMAPHandler já aplica o FilterEngine internamente e retorna a decisão.
+            logging.info("Buscando e filtrando emails nao lidos...")
             emails = self.imap.fetch_and_process(search_criteria="UNSEEN", dry_run=self.dry_run)
             stats["emails_fetchados"] = len(emails)
             logging.info(f"Encontrados {len(emails)} emails nao lidos")
 
-            # 3. Processa decisões retornadas pelo IMAPHandler
-            pending_count = 0
-            forward_count = 0
-            skip_count = 0
+            # 3. Separa emails por decisão (CORREÇÃO DO BUG filter_emails)
+            encaminhar = []
+            pendentes = []
+            bloqueados = []
 
             for email_data in emails:
                 decision = email_data.get("decision")
-                
-                if decision == "PENDING_APPROVAL":
-                    pending_count += 1
-                    # Gera botões de aprovação
-                    try:
-                        approval = self.button_handler.generate_approval_email(
-                            from_header=email_data.get("from", ""),
-                            subject=email_data.get("subject", ""),
-                            body_snippet=email_data.get("body", "")[:200],
-                            amount=email_data.get("amount", 0.0),
-                            reason=email_data.get("reason", "")
-                        )
-                        stats["aprovacoes_geradas"] += 1
-                        logging.debug(f"Aprovacao criada: {approval.get('uuid', 'N/A')}")
-                        
-                        # Salva no banco se não for dry run
-                        if not self.dry_run:
-                            db.add_pending_approval(
-                                message_id=email_data.get("message_id"),
-                                from_header=email_data.get("from", ""),
-                                subject=email_data.get("subject", ""),
-                                amount=email_data.get("amount", 0.0),
-                                reason=email_data.get("reason", "")
-                            )
-                    except Exception as e:
-                        logging.error(f"Erro ao criar aprovacao: {e}")
-                        stats["erros"] += 1
-                
-                elif decision == "FORWARD":
-                    forward_count += 1
-                    # Encaminha direto para financeiro
-                    if not self.dry_run:
-                        try:
-                            # Re-busca email original para encaminhar com anexos
-                            original_bytes = self.imap.search_by_message_id(email_data.get("message_id"))
-                            if original_bytes:
-                                self.smtp.send_email(
-                                    to_addrs=[settings.FINANCEIRO_EMAIL],
-                                    subject=f"[CP FANI] ENC: {email_data.get('subject', '')}",
-                                    body_text="Encaminhado automaticamente pelo sistema CP FANI.",
-                                    original_eml_bytes=original_bytes
-                                )
-                                stats["emails_enviados"] += 1
-                        except Exception as e:
-                            logging.error(f"Erro ao encaminhar email: {e}")
-                            stats["erros"] += 1
-                
-                elif decision.startswith("SKIP"):
-                    skip_count += 1
-                
+                if decision == "FORWARD":
+                    encaminhar.append(email_data)
+                elif decision == "PENDING_APPROVAL":
+                    pendentes.append(email_data)
+                else: # SKIP_*
+                    bloqueados.append(email_data)
+                    
                 # Marca como lido se não for dry run e não for PENDING_APPROVAL
                 if not self.dry_run and decision != "PENDING_APPROVAL":
                     self.imap.mark_as_seen(email_data.get("imap_id"))
 
-            stats["emails_filtrados"] = pending_count + forward_count
+            stats["emails_filtrados"] = len(encaminhar) + len(pendentes)
             logging.info(
-                f"Filtro: {forward_count} encaminhados, "
-                f"{pending_count} pendentes, "
-                f"{skip_count} ignorados"
+                f"Filtro: {len(encaminhar)} encaminhar, "
+                f"{len(pendentes)} pendentes, "
+                f"{len(bloqueados)} bloqueados"
             )
 
-            # 4. Envia emails de aprovacao pendentes (se nao for DRY_RUN)
+            # 4. Para emails pendentes: gera botoes de aprovacao e salva no DB
+            if pendentes:
+                logging.info(f"Gerando botoes para {len(pendentes)} emails...")
+                for email_data in pendentes:
+                    try:
+                        approval = self.button_handler.create_approval_email(email_data)
+                        stats["aprovacoes_geradas"] += 1
+                        logging.debug(f"Aprovacao criada: {approval.get('uuid')}")
+                        
+                        if not self.dry_run:
+                            db.add_pending_approval(
+                                message_id=email_data.get("message_id"),
+                                folder="INBOX",
+                                uid=None,
+                                sender=email_data.get("from", ""),
+                                sender_name="",
+                                subject=email_data.get("subject", ""),
+                                received_at=email_data.get("date"),
+                                amount_brl=email_data.get("amount"),
+                                body_snippet=email_data.get("body", "")[:500]
+                            )
+                    except Exception as e:
+                        logging.error(f"Erro ao criar aprovacao: {e}")
+                        stats["erros"] += 1
+
+            # 5. Encaminhamento IMEDIATO de emails aprovados pelo filtro (FORWARD)
+            if not self.dry_run and encaminhar:
+                logging.info(f"Encaminhando {len(encaminhar)} emails diretos para o financeiro...")
+                for email_data in encaminhar:
+                    try:
+                        original_bytes = self.imap.search_by_message_id(email_data.get("message_id"))
+                        if original_bytes:
+                            # Tenta usar forward_email se existir, senão send_email
+                            if hasattr(self.smtp, 'forward_email'):
+                                success = self.smtp.forward_email(
+                                    original_email={"bytes": original_bytes, "subject": email_data.get("subject")},
+                                    to_email=settings.FINANCEIRO_EMAIL,
+                                )
+                            else:
+                                success = self.smtp.send_email(
+                                    to_addrs=[settings.FINANCEIRO_EMAIL],
+                                    subject=f"{settings.FORWARD_SUBJECT_PREFIX} {email_data.get('subject', '')}",
+                                    body_text="Encaminhado automaticamente pelo sistema CP FANI.",
+                                    original_eml_bytes=original_bytes
+                                )
+                            if success:
+                                stats["emails_enviados"] += 1
+                                db.mark_forwarded(
+                                    message_id=email_data.get("message_id"),
+                                    sender=email_data.get("from", ""),
+                                    subject=email_data.get("subject", ""),
+                                    decision="FORWARDED"
+                                )
+                    except Exception as e:
+                        logging.error(f"Erro ao encaminhar email direto: {e}")
+                        stats["erros"] += 1
+
+            # 6. Envia emails de aprovacao pendentes do DB (se nao for DRY_RUN)
             if not self.dry_run:
                 pending_approvals = db.get_pending_approvals(only_pending=True)
-                logging.info(f"Enviando {len(pending_approvals)} emails de aprovacao...")
-                for approval in pending_approvals:
-                    try:
-                        original_bytes = self.imap.search_by_message_id(approval.get("message_id"))
-                        if original_bytes:
-                            # Usa o método genérico de envio do SMTPHandler
-                            self.smtp.send_email(
-                                to_addrs=[settings.APPROVAL_EMAIL],
-                                subject=f"[CP FANI] APROVAÇÃO: {approval.get('subject', '')}",
-                                body_text=f"Por favor, responda com APROVAR_ ou REPROVAR_ para processar.\n\nDetalhes:\n{approval}",
-                                original_eml_bytes=original_bytes
-                            )
-                            stats["emails_enviados"] += 1
-                            # Atualiza status no banco se necessário
-                    except Exception as e:
-                        logging.error(f"Erro ao enviar aprovacao: {e}")
-                        stats["erros"] += 1
+                # Filtra apenas os que ainda não tiveram o email de solicitação enviado
+                to_send = [a for a in pending_approvals if not a.get("last_reminder_at")]
+                
+                if to_send:
+                    logging.info(f"Enviando {len(to_send)} emails de solicitacao de aprovacao...")
+                    for approval in to_send:
+                        try:
+                            original = self._get_original_email(approval)
+                            if original:
+                                if hasattr(self.smtp, 'send_approval_request'):
+                                    success = self.smtp.send_approval_request(
+                                        approval=approval,
+                                        original_email=original,
+                                    )
+                                else:
+                                    success = self.smtp.send_email(
+                                        to_addrs=[settings.APPROVAL_EMAIL],
+                                        subject=f"[CP FANI] APROVAÇÃO: {approval.get('subject', '')}",
+                                        body_text=f"Por favor, responda com APROVAR_ ou REPROVAR_.\n\nDetalhes:\n{approval}",
+                                        original_eml_bytes=original.get("bytes") if isinstance(original, dict) else original
+                                    )
+                                if success:
+                                    stats["emails_enviados"] += 1
+                                    db.mark_approval_sent(approval["uuid"])
+                        except Exception as e:
+                            logging.error(f"Erro ao enviar aprovacao: {e}")
+                            stats["erros"] += 1
             else:
                 logging.info("[DRY_RUN] Pulando envio de emails")
 
-            # 5. Processa respostas (APROVAR_/REPROVAR_)
-            logging.info("Processando respostas...")
-            response_stats = self.response_handler.process_responses()
-            stats["respostas_processadas"] = (
-                response_stats.get("aprovados", 0) +
-                response_stats.get("reprovados", 0) +
-                response_stats.get("invalidos", 0)
-            )
-            logging.info(
-                f"Respostas: {response_stats.get('aprovados', 0)} aprovados, "
-                f"{response_stats.get('reprovados', 0)} reprovados, "
-                f"{response_stats.get('invalidos', 0)} invalidos"
-            )
+            # 7. Processa respostas (APROVAR_/REPROVAR_)
+            logging.info("Processando respostas de aprovação...")
+            try:
+                response_stats = self.response_handler.process_responses()
+                stats["respostas_processadas"] = (
+                    response_stats.get("aprovados", 0) +
+                    response_stats.get("reprovados", 0) +
+                    response_stats.get("invalidos", 0)
+                )
+                logging.info(
+                    f"Respostas: {response_stats.get('aprovados', 0)} aprovados, "
+                    f"{response_stats.get('reprovados', 0)} reprovados, "
+                    f"{response_stats.get('invalidos', 0)} invalidos"
+                )
+            except Exception as e:
+                logging.error(f"Erro ao processar respostas: {e}")
+                stats["erros"] += 1
 
-            # 6. Forward imediato de emails aprovados (se não for dry run)
+            # 8. Forward de emails que foram APROVADOS via resposta (status APPROVED no DB)
             if not self.dry_run:
                 self._forward_approved_emails()
 
-            # 7. Cleanup de registros antigos
+            # 9. Cleanup de registros antigos
             self._cleanup_old_records()
 
         except Exception as e:
@@ -263,37 +293,55 @@ class CPFaniPipeline:
 
         return stats
 
-    def _get_original_email(self, approval: Dict) -> Optional[bytes]:
+    def _get_original_email(self, approval: Dict) -> Optional[Dict]:
         """Re-busca email original do IMAP via Message-ID."""
         try:
             mid = approval.get("message_id")
             if not mid:
                 return None
-            return self.imap.search_by_message_id(mid)
+            
+            if hasattr(self.imap, 'search_by_message_id'):
+                raw_bytes = self.imap.search_by_message_id(mid)
+                if raw_bytes:
+                    return {"bytes": raw_bytes, "message_id": mid, "subject": approval.get("subject")}
+            
+            logging.warning(
+                f"IMAPHandler nao possui 'search_by_message_id' ou email não encontrado. "
+                f"Message-ID: {mid}"
+            )
+            return None
         except Exception as e:
             logging.error(f"Erro ao buscar email original: {e}")
         return None
 
     def _forward_approved_emails(self):
-        """Encaminha emails aprovados para o financeiro."""
+        """Encaminha emails aprovados (via resposta) para o financeiro."""
         try:
             approved = db.get_approved_not_forwarded()
             if not approved:
                 return
 
-            logging.info(f"Encaminhando {len(approved)} emails aprovados...")
+            logging.info(f"Encaminhando {len(approved)} emails aprovados para o financeiro...")
             for approval in approved:
                 try:
-                    original_bytes = self._get_original_email(approval)
-                    if original_bytes:
-                        self.smtp.send_email(
-                            to_addrs=[settings.FINANCEIRO_EMAIL],
-                            subject=f"[CP FANI] ENC: {approval.get('subject', '')}",
-                            body_text="Encaminhado após aprovação.",
-                            original_eml_bytes=original_bytes
-                        )
-                        db.mark_as_forwarded(approval.get("uuid"))
-                        logging.info(f"Email encaminhado: {approval.get('subject')}")
+                    original = self._get_original_email(approval)
+                    if original:
+                        if hasattr(self.smtp, 'forward_email'):
+                            success = self.smtp.forward_email(
+                                original_email=original,
+                                to_email=settings.FINANCEIRO_EMAIL,
+                            )
+                        else:
+                            success = self.smtp.send_email(
+                                to_addrs=[settings.FINANCEIRO_EMAIL],
+                                subject=f"{settings.FORWARD_SUBJECT_PREFIX} {approval.get('subject', '')}",
+                                body_text="Encaminhado após aprovação humana.",
+                                original_eml_bytes=original.get("bytes") if isinstance(original, dict) else original
+                            )
+                            
+                        if success:
+                            db.mark_as_forwarded(approval["uuid"])
+                            logging.info(f"Email encaminhado: {approval.get('subject')}")
                 except Exception as e:
                     logging.error(f"Erro ao encaminhar: {e}")
         except Exception as e:
@@ -303,13 +351,10 @@ class CPFaniPipeline:
         """Remove registros antigos do banco (>90 dias)."""
         try:
             cutoff = datetime.now() - timedelta(days=90)
-            # Usa método genérico do database se existir, senão loga aviso
             if hasattr(db, 'cleanup_old_approvals'):
                 deleted = db.cleanup_old_approvals(cutoff)
                 if deleted > 0:
                     logging.info(f"Cleanup: {deleted} registros removidos (>90 dias)")
-            else:
-                logging.debug("Método cleanup_old_approvals não implementado no database.")
         except Exception as e:
             logging.error(f"Erro no cleanup: {e}")
 
@@ -341,19 +386,13 @@ def generate_weekly_report():
     logging.info("Gerando relatorio semanal...")
     cutoff = datetime.now() - timedelta(days=7)
     
-    # Verifica se o método existe no database para evitar AttributeError
     if hasattr(db, 'get_weekly_stats'):
         stats = db.get_weekly_stats(cutoff)
     else:
-        logging.warning("Método get_weekly_stats não implementado no database. Usando dados mockados.")
+        logging.warning("Método get_weekly_stats não implementado. Usando dados vazios.")
         stats = {
-            "total_emails": 0,
-            "approvals_requested": 0,
-            "approvals_approved": 0,
-            "approvals_rejected": 0,
-            "emails_forwarded": 0,
-            "top_whitelist": [],
-            "top_blacklist": []
+            "total_emails": 0, "approvals_requested": 0, "approvals_approved": 0,
+            "approvals_rejected": 0, "emails_forwarded": 0, "top_whitelist": [], "top_blacklist": []
         }
 
     report = f"""
@@ -369,10 +408,10 @@ Aprovacoes reprovadas: {stats['approvals_rejected']}
 Emails encaminhados: {stats['emails_forwarded']}
 
 TOP 5 REMETENTES (WHITELIST):
-{chr(10).join(f"  {i+1}. {s}: {c} emails" for i, (s, c) in enumerate(stats['top_whitelist'][:5]))}
+{chr(10).join(f"  {i+1}. {s}: {c} emails" for i, (s, c) in enumerate(stats.get('top_whitelist', [])[:5]))}
 
 TOP 5 REMETENTES (BLACKLIST):
-{chr(10).join(f"  {i+1}. {s}: {c} emails" for i, (s, c) in enumerate(stats['top_blacklist'][:5]))}
+{chr(10).join(f"  {i+1}. {s}: {c} emails" for i, (s, c) in enumerate(stats.get('top_blacklist', [])[:5]))}
 
 TAXA DE APROVACAO:
 {(stats['approvals_approved'] / max(stats['approvals_requested'], 1) * 100):.1f}%
@@ -383,11 +422,12 @@ TAXA DE APROVACAO:
     if not settings.DRY_RUN:
         try:
             smtp = SMTPHandler()
-            smtp.send_email(
-                to_addrs=[settings.ADMIN_EMAIL],
-                subject="[CP FANI] Relatorio Semanal",
-                body_text=report,
-            )
+            if hasattr(smtp, 'send_email'):
+                smtp.send_email(
+                    to_addrs=[settings.ADMIN_EMAIL],
+                    subject="[CP FANI] Relatorio Semanal",
+                    body_text=report,
+                )
             logging.info("Relatorio enviado por email")
         except Exception as e:
             logging.error(f"Erro ao enviar relatorio: {e}")
@@ -401,24 +441,16 @@ def main():
         description="CP FANI - Sistema de Encaminhamento de Emails"
     )
     parser.add_argument(
-        "--continuous",
-        action="store_true",
-        help="Rodar em modo continuo (daemon)",
+        "--continuous", action="store_true", help="Rodar em modo continuo (daemon)",
     )
     parser.add_argument(
-        "--weekly-report",
-        action="store_true",
-        help="Gerar relatorio semanal",
+        "--weekly-report", action="store_true", help="Gerar relatorio semanal",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Modo teste (nao envia emails)",
+        "--dry-run", action="store_true", help="Modo teste (nao envia emails)",
     )
     parser.add_argument(
-        "--test-connection",
-        action="store_true",
-        help="Testar conexões IMAP e SMTP e sair",
+        "--test-connection", action="store_true", help="Testar conexões IMAP e SMTP e sair",
     )
     
     args = parser.parse_args()
