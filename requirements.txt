@@ -8,13 +8,11 @@
 # Atualizar com: pip install --upgrade -r requirements.txt
 # ==============================================================================
 
-
 # ------------------------------------------------------------------------------
 # 1. CONFIGURAÇÃO
 # ------------------------------------------------------------------------------
 # Carrega variáveis do arquivo .env automaticamente
 python-dotenv==1.0.1
-
 
 # ------------------------------------------------------------------------------
 # 2. PARSING E MANIPULAÇÃO DE DATAS
@@ -22,37 +20,46 @@ python-dotenv==1.0.1
 # Parse de datas RFC 2822 dos headers de email (Date: Fri, 21 Aug 2026...)
 python-dateutil==2.9.0.post0
 
+# ------------------------------------------------------------------------------
+# 3. TEMPLATE E PARSING HTML (Adicionado na Fase Qwen)
+# ------------------------------------------------------------------------------
+# Jinja2 para renderização de templates de email (se aplicável no futuro)
+jinja2==3.1.4
+# BeautifulSoup4 para extração de texto de emails HTML (fallback no parser)
+beautifulsoup4==4.12.3
 
 # ------------------------------------------------------------------------------
-# 3. VALIDAÇÃO DE EMAIL (OPCIONAL - RECOMENDADO)
+# 4. VALIDAÇÃO DE EMAIL (OPCIONAL - RECOMENDADO)
 # ------------------------------------------------------------------------------
 # Valida sintaxe e domínio dos emails antes de enviar
 # Descomente se quiser validação mais rigorosa
 # email-validator==2.1.0.post1
 
+# ------------------------------------------------------------------------------
+# 5. AUTENTICAÇÃO OAUTH2 (OPCIONAL - PARA GMAIL)
+# ------------------------------------------------------------------------------
+# Necessário apenas se usar Gmail com OAuth2 em vez de Senha de App
+# google-auth-oauthlib==1.2.0
 
 # ------------------------------------------------------------------------------
-# 4. HTTP / APIs EXTERNAS (OPCIONAL - USO FUTURO)
+# 6. HTTP / APIs EXTERNAS (OPCIONAL - USO FUTURO)
 # ------------------------------------------------------------------------------
 # Necessário apenas se integrar com APIs (Telegram, Slack, webhook, etc)
 # requests==2.31.0
 
-
 # ------------------------------------------------------------------------------
-# 5. LOGGING AVANÇADO (OPCIONAL)
+# 7. LOGGING AVANÇADO (OPCIONAL)
 # ------------------------------------------------------------------------------
 # Logs coloridos no terminal (DEBUG=verde, ERROR=vermelho)
 # Descomente se quiser output mais legível durante desenvolvimento
 # colorlog==6.8.2
 
-
 # ------------------------------------------------------------------------------
-# 6. ASSÍNCRONO (OPCIONAL - EVOLUÇÃO FUTURA)
+# 8. ASSÍNCRONO (OPCIONAL - EVOLUÇÃO FUTURA)
 # ------------------------------------------------------------------------------
 # Necessário apenas se evoluir o pipeline para async (processamento paralelo)
 # aiohttp==3.9.3
 # aiosmtplib==3.0.1
-
 
 # ==============================================================================
 # MÓDULOS BUILT-IN (NÃO PRECISAM ESTAR AQUI - APENAS DOCUMENTAÇÃO)
