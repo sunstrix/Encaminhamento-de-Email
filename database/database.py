@@ -1,33 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-==============================================================================
 SISTEMA DE ENCAMINHAMENTO DE EMAILS - CP FANI
 Arquivo: database/database.py
-==============================================================================
 Persistencia SQLite. Stdlib only (sqlite3), sem dependencias externas.
 Usa `with` + WAL mode para seguranca contra quedas de energia durante o
 cron hourly. Todas as operacoes sao idempotentes.
 
 Tabelas:
-- forwarded_emails : historico de Message-IDs ja encaminhados (evita duplicata)
-- pending_approvals: emails com > X R$ aguardando botao APROVAR/REPROVAR
-- blacklist        : remetentes que o usuario bloqueou manualmente
-- whitelist        : remetentes sempre aprovados (excecao da regra de assunto)
-- state            : checkpoint da ultima varredura (cron hourly + semanal)
+forwarded_emails : historico de Message-IDs ja encaminhados (evita duplicata)
+pending_approvals: emails com > X R$ aguardando botao APROVAR/REPROVAR
+blacklist        : remetentes que o usuario bloqueou manualmente
+whitelist        : remetentes sempre aprovados (excecao da regra de assunto)
+state            : checkpoint da ultima varredura (cron hourly + semanal)
+
+Correções Qwen (Arquivo 7):
+- Adição de métodos de suporte ao main.py: get_weekly_stats, cleanup_old_approvals,
+  get_approved_not_forwarded, mark_as_forwarded, mark_approval_sent.
+- Correção de sintaxe: Path(__file__) e __name__.
 ==============================================================================
 """
-
 import sys
 from pathlib import Path
 
-# --- FIX DE PATH (EXECUCAO STANDALONE) -----------------------------------
+# -----------------------------------------------------------------------------
+# FIX DE PATH (EXECUCAO STANDALONE)
+# -----------------------------------------------------------------------------
 # Garante que a raiz do projeto esteja no sys.path para imports absolutos.
 # Necessario quando o script eh executado diretamente (python database/database.py)
 # em vez de como modulo (python -m database.database).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 import sqlite3
 import threading
@@ -38,10 +42,9 @@ from typing import Dict, List, Optional
 
 from config.settings import settings
 
-
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # SCHEMA (migracoes incrementais - cada versao e um IF NOT EXISTS/ALTER)
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _SCHEMA = """
 -- Historico de Message-IDs ja processados.
 -- Evita re-enviar email se o cron rodar duas vezes sobre o mesmo ID.
@@ -53,7 +56,6 @@ CREATE TABLE IF NOT EXISTS forwarded_emails (
     folder       TEXT DEFAULT 'INBOX',
     decision     TEXT DEFAULT 'FORWARDED'  -- FORWARDED | SKIPPED_DOMAIN | SKIPPED_SUBJECT | BLACKLISTED
 );
-
 CREATE INDEX IF NOT EXISTS idx_forwarded_sender ON forwarded_emails(sender);
 CREATE INDEX IF NOT EXISTS idx_forwarded_at     ON forwarded_emails(forwarded_at);
 
@@ -77,7 +79,6 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     notes           TEXT,
     last_reminder_at TEXT
 );
-
 CREATE INDEX IF NOT EXISTS idx_pending_status    ON pending_approvals(status);
 CREATE INDEX IF NOT EXISTS idx_pending_msgid     ON pending_approvals(message_id);
 CREATE INDEX IF NOT EXISTS idx_pending_created   ON pending_approvals(created_at);
@@ -121,6 +122,7 @@ class Database:
     # ------------------------------------------------------------------ utils
     def _connect(self) -> sqlite3.Connection:
         """Conexao com pragmas de seguranca/performance.
+
         WAL: escrita nao bloqueia leitura (importante p/ relatorio rodando
         ao mesmo tempo que o cron). foreign_keys ON (defensivo).
         """
@@ -319,6 +321,90 @@ class Database:
                 (now, approval_uuid),
             )
 
+    # ============================================================ NOVOS MÉTODOS (QWEN)
+    def mark_approval_sent(self, approval_uuid: str) -> bool:
+        """Marca que o email de solicitação de aprovação foi enviado.
+        Usa last_reminder_at como timestamp de atividade para não alterar o schema.
+        """
+        now = self._utcnow_iso()
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE pending_approvals SET last_reminder_at = ? WHERE uuid = ?",
+                (now, approval_uuid),
+            )
+            return cur.rowcount > 0
+
+    def get_approved_not_forwarded(self) -> List[Dict]:
+        """Busca aprovações aprovadas mas ainda não encaminhadas."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_approvals WHERE status = 'APPROVED' ORDER BY resolved_at ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_as_forwarded(self, approval_uuid: str) -> bool:
+        """Atualiza o status da aprovação para FORWARDED."""
+        return self.resolve_approval(approval_uuid, "FORWARDED", resolved_by="SYSTEM")
+
+    def cleanup_old_approvals(self, cutoff: datetime) -> int:
+        """Remove registros antigos de aprovações resolvidas e histórico de encaminhamento."""
+        iso_cutoff = cutoff.astimezone(timezone.utc).isoformat(timespec="seconds")
+        deleted_count = 0
+        with self._tx() as conn:
+            # Remove aprovações antigas que não estão pendentes
+            cur = conn.execute(
+                "DELETE FROM pending_approvals WHERE created_at < ? AND status != 'PENDING'",
+                (iso_cutoff,)
+            )
+            deleted_count += cur.rowcount
+            
+            # Remove histórico de forwarded antigo
+            cur = conn.execute(
+                "DELETE FROM forwarded_emails WHERE forwarded_at < ?",
+                (iso_cutoff,)
+            )
+            deleted_count += cur.rowcount
+        return deleted_count
+
+    def get_weekly_stats(self, since: datetime) -> Dict:
+        """Gera estatísticas para o relatório semanal."""
+        iso_since = since.astimezone(timezone.utc).isoformat(timespec="seconds")
+        with self._tx() as conn:
+            total_emails = conn.execute(
+                "SELECT COUNT(*) FROM forwarded_emails WHERE forwarded_at >= ?", (iso_since,)
+            ).fetchone()[0]
+            
+            approvals_requested = conn.execute(
+                "SELECT COUNT(*) FROM pending_approvals WHERE created_at >= ?", (iso_since,)
+            ).fetchone()[0]
+            
+            approvals_approved = conn.execute(
+                "SELECT COUNT(*) FROM pending_approvals WHERE created_at >= ? AND status IN ('APPROVED', 'FORWARDED')", (iso_since,)
+            ).fetchone()[0]
+            
+            approvals_rejected = conn.execute(
+                "SELECT COUNT(*) FROM pending_approvals WHERE created_at >= ? AND status = 'REJECTED'", (iso_since,)
+            ).fetchone()[0]
+            
+            emails_forwarded = conn.execute(
+                "SELECT COUNT(*) FROM forwarded_emails WHERE forwarded_at >= ? AND decision = 'FORWARDED'", (iso_since,)
+            ).fetchone()[0]
+            
+            # Como não há tabela de logs de uso por remetente, retornamos listas vazias
+            # para atender à interface esperada pelo main.py sem quebrar.
+            top_whitelist = []
+            top_blacklist = []
+            
+        return {
+            "total_emails": total_emails,
+            "approvals_requested": approvals_requested,
+            "approvals_approved": approvals_approved,
+            "approvals_rejected": approvals_rejected,
+            "emails_forwarded": emails_forwarded,
+            "top_whitelist": top_whitelist,
+            "top_blacklist": top_blacklist
+        }
+
     # ============================================================ blacklist
     def is_blacklisted(self, email: str) -> bool:
         if not email:
@@ -452,10 +538,9 @@ class Database:
 # Instancia unica consumida pelos modulos
 db = Database()
 
-
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # AUTO-TESTE: python database/database.py
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 70)
     print("CP FANI - AUTO-TESTE DE DATABASE")
