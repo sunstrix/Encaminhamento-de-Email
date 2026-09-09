@@ -53,3 +53,4 @@ Desktop.ini
 .DS_Store
 .vscode/
 .idea/
+.env.example.txt
